@@ -560,9 +560,7 @@ def _sorted_states_to_json(
             ent_results[-1] = LazyState(prev_state)
 
     # Filter out the empty lists if some states had 0 results.
-    js = {key: val for key, val in result.items() if val}
-    # _LOGGER.info("JS: %s", js)
-    return js
+    return {key: val for key, val in result.items() if val}
 
 
 def get_state(hass, utc_point_in_time, entity_id, run=None):
