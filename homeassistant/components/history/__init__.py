@@ -1,6 +1,8 @@
 """Provide pre-made queries on top of the recorder component."""
 from collections import defaultdict
 from datetime import timedelta
+import functools
+from heapq import merge
 from itertools import groupby
 import json
 import logging
@@ -8,8 +10,9 @@ import time
 from typing import Optional, cast
 
 from aiohttp import web
-from sqlalchemy import and_, bindparam, func
+from sqlalchemy import Column, DateTime, Integer, String, Text, and_, bindparam, func
 from sqlalchemy.ext import baked
+from sqlalchemy.ext.declarative import declarative_base
 import voluptuous as vol
 
 from homeassistant.components import recorder
@@ -113,36 +116,65 @@ def _get_significant_states(
     as well as all states from certain domains (for instance
     thermostat so that we get current temperature in our graphs).
     """
+    # _LOGGER.info("_get_significant_states: %s, %s", entity_ids, minimal_response)
     timer_start = time.perf_counter()
 
-    baked_query = hass.data[HISTORY_BAKERY](
-        lambda session: session.query(*QUERY_STATES)
-    )
+    states = []
+    # recorder_types = [[States, QUERY_STATES]]
+    # if entity_ids is not None and len(entity_ids) == 1 and "sensor.derp" in entity_ids:
+    #     recorder_types = [[TbStates, QUERY_TBSTATES]]
+    # if entity_ids is not None and len(entity_ids) == 1 and "sensor.herp" in entity_ids:
+    #     recorder_types = [[States, QUERY_STATES]]
+    # for recorder_type in recorder_types:
+    # for recorder_type in ([TbStates, QUERY_TBSTATES], [States, QUERY_STATES]):
+    # if entity_ids is None:
+    #     for recorder_type in ([TbStates, QUERY_TBSTATES], [States, QUERY_STATES]):
+    #         # for recorder_type in [[TbStates, QUERY_TBSTATES]]:
+    #         states_partial = _get_significant_states_hack(
+    #             recorder_type[0],
+    #             recorder_type[1],
+    #             hass,
+    #             session,
+    #             start_time,
+    #             end_time,
+    #             entity_ids,
+    #             filters,
+    #             include_start_time_state,
+    #             significant_changes_only,
+    #             minimal_response,
+    #         )
+    #         _LOGGER.info("parrtil: %s", states_partial)
+    #         states.extend(states_partial)
 
-    if significant_changes_only:
-        baked_query += lambda q: q.filter(
-            (
-                States.domain.in_(SIGNIFICANT_DOMAINS)
-                | (States.last_changed == States.last_updated)
-            )
-            & (States.last_updated > bindparam("start_time"))
+    # else:
+    # for ent in entity_ids:
+    for recorder_type in ([TbStates, QUERY_TBSTATES], [States, QUERY_STATES]):
+        # for recorder_type in [[TbStates, QUERY_TBSTATES]]:
+        states_partial = _get_significant_states_hack(
+            recorder_type[0],
+            recorder_type[1],
+            hass,
+            session,
+            start_time,
+            end_time,
+            entity_ids,
+            # [ent],
+            filters,
+            include_start_time_state,
+            significant_changes_only,
+            minimal_response,
         )
-    else:
-        baked_query += lambda q: q.filter(States.last_updated > bindparam("start_time"))
 
-    if filters:
-        filters.bake(baked_query, entity_ids)
+        def cmp(x, y):
+            return (x > y) - (x < y)
 
-    if end_time is not None:
-        baked_query += lambda q: q.filter(States.last_updated < bindparam("end_time"))
+        def compare(a, b):
+            f = cmp(a[1], b[1])
+            if f != 0:
+                return f
+            return cmp(a[5], b[5])
 
-    baked_query += lambda q: q.order_by(States.entity_id, States.last_updated)
-
-    states = execute(
-        baked_query(session).params(
-            start_time=start_time, end_time=end_time, entity_ids=entity_ids
-        )
-    )
+        states = merge(states, states_partial, key=functools.cmp_to_key(compare))
 
     if _LOGGER.isEnabledFor(logging.DEBUG):
         elapsed = time.perf_counter() - timer_start
@@ -160,8 +192,114 @@ def _get_significant_states(
     )
 
 
+def _get_significant_states_hack(
+    table_class,
+    query_states,
+    hass,
+    session,
+    start_time,
+    end_time=None,
+    entity_ids=None,
+    filters=None,
+    include_start_time_state=True,
+    significant_changes_only=True,
+    minimal_response=False,
+):
+    """
+    Return states changes during UTC period start_time - end_time.
+
+    Significant states are all states where there is a state change,
+    as well as all states from certain domains (for instance
+    thermostat so that we get current temperature in our graphs).
+    """
+    # _LOGGER.info(
+    #     "_get_significant_states_hack: %s, %s, %s",
+    #     entity_ids,
+    #     minimal_response,
+    #     table_class,
+    # )
+    # timer_start = time.perf_counter()
+    # _LOGGER.info("_get_significant_states_hack qs: %s", query_states)
+    # _LOGGER.info("_get_significant_states_hack qsA: %s", QUERY_TBSTATES)
+    # _LOGGER.info("_get_significant_states_hack qsB: %s", QUERY_STATES)
+    # baked_query = hass.data[HISTORY_BAKERY](
+    #     lambda session: session.query(*query_states)
+    # )
+
+    # this looks silly but it seems like i need a different statement when creating the lambda otherwise it get wrong one from the cache
+    if table_class == TbStates:
+        baked_query = hass.data[HISTORY_BAKERY](
+            lambda session: session.query(*query_states)
+        )
+    else:
+        baked_query = hass.data[HISTORY_BAKERY](
+            lambda session: session.query(*query_states)
+        )
+
+    # baked_query = hass.data[HISTORY_BAKERY](
+    #     lambda session: session.query(*query_states)
+    #     # lambda session: session.query(*query_states)
+    # )
+    # _LOGGER.info("bakeddd: %s", baked_query)
+    # baked_query = hass.data[HISTORY_BAKERY](
+    #     lambda session: session.query(*query_states)
+    # )
+    # _LOGGER.info("rebakeddd: %s", baked_query)
+    if significant_changes_only:
+        baked_query += lambda q: q.filter(
+            (
+                table_class.domain.in_(SIGNIFICANT_DOMAINS)
+                | (table_class.last_changed == table_class.last_updated)
+            )
+            & (table_class.last_updated > bindparam("start_time"))
+        )
+    else:
+        baked_query += lambda q: q.filter(
+            table_class.last_updated > bindparam("start_time")
+        )
+
+    if filters:
+        filters.bake(baked_query, entity_ids, table_class)
+
+    if end_time is not None:
+        baked_query += lambda q: q.filter(
+            table_class.last_updated < bindparam("end_time")
+        )
+
+    baked_query += lambda q: q.order_by(table_class.entity_id, table_class.last_updated)
+    # _LOGGER.info(
+    #     "qqqq %s\n%s",
+    #     entity_ids,
+    #     baked_query(session).params(
+    #         start_time=start_time, end_time=end_time, entity_ids=entity_ids
+    #     ),
+    # )
+    states = execute(
+        baked_query(session).params(
+            start_time=start_time, end_time=end_time, entity_ids=entity_ids
+        )
+    )
+    # _LOGGER.info("xxxhackstates %s = %d (%s)", entity_ids, len(states), table_class)
+    # if _LOGGER.isEnabledFor(logging.DEBUG):
+    #     elapsed = time.perf_counter() - timer_start
+    #     _LOGGER.debug("get_significant_states took %fs", elapsed)
+
+    # return _sorted_states_to_json(
+    #     hass,
+    #     session,
+    #     states,
+    #     start_time,
+    #     entity_ids,
+    #     filters,
+    #     include_start_time_state,
+    #     minimal_response,
+    # )
+    return states
+
+
 def state_changes_during_period(hass, start_time, end_time=None, entity_id=None):
     """Return states changes during UTC period start_time - end_time."""
+    _LOGGER.info("state_changes_during_period: %s", entity_id)
     with session_scope(hass=hass) as session:
         baked_query = hass.data[HISTORY_BAKERY](
             lambda session: session.query(*QUERY_STATES)
@@ -234,6 +372,7 @@ def get_last_state_changes(hass, number_of_states, entity_id):
 
 def get_states(hass, utc_point_in_time, entity_ids=None, run=None, filters=None):
     """Return the states at a specific point in time."""
+    # _LOGGER.info("get_states: %s", entity_ids)
     if run is None:
         run = recorder.run_information_from_instance(hass, utc_point_in_time)
 
@@ -250,6 +389,7 @@ def get_states(hass, utc_point_in_time, entity_ids=None, run=None, filters=None)
 def _get_states_with_session(
     hass, session, utc_point_in_time, entity_ids=None, run=None, filters=None
 ):
+    # _LOGGER.info("_get_states_with_session: %s", entity_ids)
     """Return the states at a specific point in time."""
     if entity_ids and len(entity_ids) == 1:
         return _get_single_entity_states_with_session(
@@ -310,19 +450,25 @@ def _get_states_with_session(
 def _get_single_entity_states_with_session(hass, session, utc_point_in_time, entity_id):
     # Use an entirely different (and extremely fast) query if we only
     # have a single entity id
+    # _LOGGER.info("_get_single_entity_states_with_session: %s", entity_id)
     baked_query = hass.data[HISTORY_BAKERY](
-        lambda session: session.query(*QUERY_STATES)
+        lambda session: session.query(*QUERY_TBSTATES)
     )
     baked_query += lambda q: q.filter(
-        States.last_updated < bindparam("utc_point_in_time"),
-        States.entity_id == bindparam("entity_id"),
+        TbStates.last_updated < bindparam("utc_point_in_time"),
+        TbStates.entity_id == bindparam("entity_id"),
     )
-    baked_query += lambda q: q.order_by(States.last_updated.desc())
+    baked_query += lambda q: q.order_by(TbStates.last_updated.desc())
     baked_query += lambda q: q.limit(1)
 
     query = baked_query(session).params(
         utc_point_in_time=utc_point_in_time, entity_id=entity_id
     )
+    # _LOGGER.info("QEURY: %s", query)
+    # results = execute(query)
+    # _LOGGER.info("RESULT n: %s", len(results))
+    # for r in results:
+    #     _LOGGER.info("RESULT state: %s", r.state)
 
     return [LazyState(row) for row in execute(query)]
 
@@ -361,6 +507,7 @@ def _sorted_states_to_json(
         for state in _get_states_with_session(
             hass, session, start_time, entity_ids, run=run, filters=filters
         ):
+            # _LOGGER.info(" IST found state %s for %s", state.state, state.entity_id)
             state.last_changed = start_time
             state.last_updated = start_time
             result[state.entity_id].append(state)
@@ -413,7 +560,9 @@ def _sorted_states_to_json(
             ent_results[-1] = LazyState(prev_state)
 
     # Filter out the empty lists if some states had 0 results.
-    return {key: val for key, val in result.items() if val}
+    js = {key: val for key, val in result.items() if val}
+    # _LOGGER.info("JS: %s", js)
+    return js
 
 
 def get_state(hass, utc_point_in_time, entity_id, run=None):
@@ -603,18 +752,18 @@ class Filters:
 
         return query
 
-    def bake(self, baked_query, entity_ids=None):
+    def bake(self, baked_query, entity_ids=None, state_class=States):
         """Update a baked query.
 
         Works the same as apply on a baked_query.
         """
         if entity_ids is not None:
             baked_query += lambda q: q.filter(
-                States.entity_id.in_(bindparam("entity_ids", expanding=True))
+                state_class.entity_id.in_(bindparam("entity_ids", expanding=True))
             )
             return
 
-        baked_query += lambda q: q.filter(~States.domain.in_(IGNORE_DOMAINS))
+        baked_query += lambda q: q.filter(~state_class.domain.in_(IGNORE_DOMAINS))
 
         if (
             self.excluded_entities
@@ -778,3 +927,38 @@ class LazyState(State):
             and self.state == other.state
             and self.attributes == other.attributes
         )
+
+
+# SQLAlchemy Schema
+# pylint: disable=invalid-name
+Base = declarative_base()
+
+TABLE_TBSTATES = "tbstates"
+
+
+class TbStates(Base):  # type: ignore
+    """(TB)State change history."""
+
+    __tablename__ = TABLE_TBSTATES
+    state_id = Column(Integer, primary_key=True)  # lol j/k
+    domain = Column(String(64))
+    entity_id = Column(String(255))
+    state = Column(String(255))
+    attributes = Column(Text)
+    event_id = Column(Integer)
+    last_changed = Column(DateTime(timezone=True))
+    last_updated = Column(DateTime(timezone=True))
+    created = Column(DateTime(timezone=True))
+    old_state_id = Column(Integer)
+
+    __table_args__ = ()
+
+
+QUERY_TBSTATES = [
+    TbStates.domain,
+    TbStates.entity_id,
+    TbStates.state,
+    TbStates.attributes,
+    TbStates.last_changed,
+    TbStates.last_updated,
+]
